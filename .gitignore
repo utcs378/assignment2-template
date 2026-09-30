@@ -1,0 +1,12 @@
+__pycache__
+*.pth
+.vscode/
+picotron.egg-info
+*.ipynb
+wandb
+tmp
+debug
+bench
+sandbox
+hf_model_safetensors/
+hf_model/

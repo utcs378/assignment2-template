@@ -1,0 +1,187 @@
+
+"""
+python create_config.py --out_dir tmp --exp_name test_2_node --tp 2 --cp 2 --pp 2 --dp 2 --model_name HuggingFaceTB/SmolLM-360M-Instruct --num_attention_heads 16 --num_key_value_heads 4 --grad_acc_steps 1 --mbs 32 --seq_len 4096 --use_wandb
+"""
+import os
+from copy import deepcopy
+from transformers import AutoConfig
+import shutil
+import argparse
+import json
+from typing import Optional
+
+def create_single_config(
+    out_dir: str,
+    tp: int,
+    cp: int,
+    dp: int,
+    pp: int,
+    pp_engine: str,
+    dp_engine: str,
+    model_name: str,
+    num_hidden_layers: Optional[int],
+    num_attention_heads: Optional[int],
+    num_key_value_heads: Optional[int],
+    grad_acc_steps: int,
+    mbs: int,
+    seq_len: int,
+    subset_name: Optional[str],
+    exp_name: str,
+    cp_mode: str = "ring",
+    sequence_parallel: bool = False,
+    use_wandb: bool = False,
+    use_cpu: bool = False,
+    optimizer_type: str = "sgd",
+    momentum: float = 0.9,
+    use_fused_adam: bool = False,
+    disable_flash_attention: bool = True,
+    hf_token: str = None,
+    vocab_padding_en = False,
+    cp_seq_padding_en = False,
+    fuse_qkv_en=False,
+    cp_zigzag_en=False
+):
+    run_path = os.path.join(out_dir, exp_name)
+
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    with open("template/base_config.json", "r") as f:
+        base_config = json.load(f)
+
+    config_content = deepcopy(base_config)
+    config_content["training"]["seq_length"] = seq_len
+    config_content["checkpoint"]["save_dir"] = run_path
+    config_content["dataset"]["subset_name"] = subset_name
+
+    config_content["model"]["name"] = model_name
+
+    tmp_model_config = AutoConfig.from_pretrained(model_name, token=hf_token)
+    config_content["model"]["num_hidden_layers"] = tmp_model_config.num_hidden_layers if num_hidden_layers is None else num_hidden_layers
+    config_content["model"]["num_attention_heads"] = tmp_model_config.num_attention_heads if num_attention_heads is None else num_attention_heads
+    config_content["model"]["num_key_value_heads"] = tmp_model_config.num_key_value_heads if num_key_value_heads is None else num_key_value_heads
+    config_content["model"]["use_flash_attention"] = not disable_flash_attention
+    config_content["model"]["use_fused_adam"] = use_fused_adam
+    config_content["model"]["vocab_padding_en"] = vocab_padding_en
+    config_content["model"]["fuse_qkv_en"] = fuse_qkv_en
+    config_content["model"]["cp_zigzag_en"] = cp_zigzag_en
+    del tmp_model_config
+
+    config_content['distributed']['tp_size'] = tp
+    config_content['distributed']['sequence_parallel'] = sequence_parallel
+    config_content['distributed']['cp_size'] = cp
+    config_content['distributed']['cp_mode'] = cp_mode
+    config_content['distributed']['dp_size'] = dp
+    config_content['distributed']['pp_size'] = pp
+    config_content['distributed']['pp_engine'] = pp_engine
+    config_content['distributed']['dp_engine'] = dp_engine
+    config_content['distributed']['use_cpu'] = use_cpu
+    config_content["distributed"]["cp_seq_padding_en"] = cp_seq_padding_en
+    config_content["environment"]["FLASH_ATTEN"] = "0" if disable_flash_attention or use_cpu else "1"
+    if use_cpu:
+        config_content["distributed"]["backend"] = "gloo"
+
+    config_content['logging']['use_wandb'] = use_wandb
+    config_content['logging']['run_name'] = exp_name
+
+    gbs = dp * mbs * grad_acc_steps
+    gbs_token = gbs * seq_len
+    print(f"Gbs_token: {gbs_token:,}, Gbs: {gbs}, dp: {dp}, seq_len: {seq_len}, grad_acc_steps: {grad_acc_steps}, mbs: {mbs}")
+    
+    config_content['training']['gradient_accumulation_steps'] = grad_acc_steps
+    config_content['training']['micro_batch_size'] = mbs
+    config_content['training']['optimizer_type'] = optimizer_type
+    config_content['training']['momentum'] = momentum
+    
+    if os.path.exists(run_path):
+        shutil.rmtree(run_path)
+    
+    os.makedirs(run_path)
+    with open(os.path.join(run_path, "config.json"), "w") as new_config:
+        json.dump(config_content, new_config, indent=4)
+    del config_content
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_dir", type=str, help="Output directory to store the configs", default="tmp")
+    parser.add_argument("--tp", type=int, help="number of tensor parallelism", default=1)
+    parser.add_argument("--sequence_parallel", action="store_true", help="Shard sequence-dependent activations across tensor-parallel ranks")
+    parser.add_argument("--cp", type=int, help="number of context parallelism", default=1)
+    parser.add_argument("--cp_mode", choices=["ring", "headwise"], help="context parallel attention implementation", default="ring")
+    parser.add_argument("--dp", type=int, help="number of data parallelism", default=1)
+    parser.add_argument("--pp", type=int, help="number of pipeline parallelism", default=1)
+    parser.add_argument("--pp_engine", type=str, help="pipeline parallel engine", default="1f1b")
+    parser.add_argument("--dp_engine", choices=["bucket", "naive"], help="data parallel engine", default="bucket")
+    parser.add_argument("--model_name", type=str, help="Model name to create configs for", default="JackFram/llama-160m")
+    parser.add_argument("--num_hidden_layers", type=int, help="Number of hidden layers", default=None)
+    parser.add_argument("--num_attention_heads", type=int, help="Number of attention heads", default=None)
+    parser.add_argument("--num_key_value_heads", type=int, help="Number of key value heads", default=None)
+    parser.add_argument("--grad_acc_steps", type=int, help="grad accumulation", default=1)
+    parser.add_argument("--mbs", type=int, help="micro batch size", default=1)
+    parser.add_argument("--seq_len", type=int, help="Sequence length", default=1024)
+    parser.add_argument("--subset_name", type=str, help="Subset name", default=None)
+    parser.add_argument("--exp_name", type=str, help="Experiment name", default="dummy_exp")
+    parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
+    parser.add_argument("--use_cpu", action="store_true", help="Use CPU for training")
+    parser.add_argument("--optimizer_type", choices=["adamw", "sgd", "sgd_momentum"], help="Optimizer type", default="sgd")
+    parser.add_argument("--momentum", type=float, help="Momentum for sgd_momentum optimizer", default=0.9)
+    parser.add_argument("--use_fused_adam", action="store_true", help="Use fused adam")
+    parser.add_argument("--enable_flash_attention", action="store_true", help="Use FlashAttention instead of PyTorch scaled dot product attention (requires an Ampere or newer GPU)")
+    parser.add_argument("--hf_token", type=str, help="HF token")
+    parser.add_argument(
+    "--vocab_padding_en",
+    action="store_true",
+        help="Enable vocabulary padding for tensor-parallel embedding and output projection.",
+    )
+
+    parser.add_argument(
+        "--cp_seq_padding_en",
+        action="store_true",
+        help="Enable sequence padding for context parallelism.",
+    )
+
+    parser.add_argument(
+        "--fuse_qkv_en",
+        action="store_true",
+        help="Enable fused QKV projection.",
+    )
+    parser.add_argument(
+        "--cp_zigzag_en",
+        action="store_true",
+        help="Enable zigzag sequence partitioning for context parallelism.",
+    )
+    args=parser.parse_args()
+    
+    create_single_config(
+        out_dir=args.out_dir,
+        tp=args.tp,
+        sequence_parallel=args.sequence_parallel,
+        cp=args.cp,
+        cp_mode=args.cp_mode,
+        dp=args.dp,
+        pp=args.pp,
+        pp_engine=args.pp_engine,
+        dp_engine=args.dp_engine,
+        model_name=args.model_name,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        grad_acc_steps=args.grad_acc_steps,
+        mbs=args.mbs,
+        seq_len=args.seq_len,
+        subset_name=args.subset_name,
+        exp_name=args.exp_name,
+        use_wandb=args.use_wandb,
+        use_cpu=args.use_cpu,
+        optimizer_type=args.optimizer_type,
+        momentum=args.momentum,
+        use_fused_adam=args.use_fused_adam,
+        disable_flash_attention=not args.enable_flash_attention,
+        hf_token=args.hf_token,
+        vocab_padding_en=args.vocab_padding_en,
+        cp_seq_padding_en=args.cp_seq_padding_en,
+        fuse_qkv_en=args.fuse_qkv_en,
+        cp_zigzag_en=args.cp_zigzag_en
+    )    
+
+    print("Config created successfully! ✅")
