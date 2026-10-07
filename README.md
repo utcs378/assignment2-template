@@ -984,6 +984,25 @@ python create_config.py \
   --sequence_parallel
 ```
 
+### Unit tests
+
+We added distributed unit tests for the applicable Part 3 features: vocabulary
+padding, fused QKV, zigzag attention, headwise context parallelism, and
+sequence parallelism.  Non-divisible sequence lengths are excluded.
+
+On the two-node GPU lease, run the same command on both nodes from the
+`assignment2` repository:
+
+```bash
+FLASH_ATTEN=0 bash tests/run_part3_tests.sh
+```
+
+To run one test, use its dedicated launcher on both nodes, for example:
+
+```bash
+FLASH_ATTEN=0 bash tests/run_fused_qkv_test.sh
+```
+
 ## Submission
 
 Submit the following:

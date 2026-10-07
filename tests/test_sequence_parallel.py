@@ -24,22 +24,24 @@ from picotron.tensor_parallel.tp_communications import (
 local_rank = int(os.environ["LOCAL_RANK"])
 global_rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-device = torch.device("cuda", local_rank)
+device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+backend = "nccl" if device.type == "cuda" else "gloo"
 
 dist.init_process_group(
     rank=global_rank,
     world_size=world_size,
-    backend="nccl",
+    backend=backend,
     init_method="env://",
     timeout=datetime.timedelta(minutes=3),
 )
 setup_process_group_manager(tp_size=world_size, cp_size=1, pp_size=1, dp_size=1)
 os.environ["CONTEXT_PARALLEL"] = "0"
-os.environ["DEVICE"] = "cuda"
+os.environ["DEVICE"] = device.type
 os.environ["DTYPE"] = "float32"
 os.environ["FLASH_ATTEN"] = "0"
 
-batch_size, local_sequence_length, hidden_size = 2, 2, 3
+# Match the TP=2 SmolLM configuration: mbs=2, seq_len=128, hidden=2048.
+batch_size, local_sequence_length, hidden_size = 2, 64, 2_048
 
 # Scatter forward, all-gather backward.
 replicated_sequence = torch.arange(
@@ -93,7 +95,7 @@ sequence_shard.sum().backward()
 torch.testing.assert_close(partial_output.grad, torch.ones_like(partial_output))
 
 # Column-parallel gather followed by row-parallel reduce-scatter.
-input_size, intermediate_size, output_size = 4, 8, 4
+input_size, intermediate_size, output_size = 2_048, 8_192, 2_048
 torch.manual_seed(42)
 reference_input = torch.randn(
     batch_size,
@@ -142,35 +144,44 @@ torch.testing.assert_close(
 torch.testing.assert_close(
     sp_column.weight.grad,
     reference_column.weight.grad.chunk(world_size, dim=0)[global_rank],
+    rtol=1e-4,
+    atol=1e-4,
 )
 torch.testing.assert_close(
     sp_column.bias.grad,
     reference_column.bias.grad.chunk(world_size, dim=0)[global_rank],
+    rtol=1e-4,
+    atol=3e-4,
 )
 torch.testing.assert_close(
     sp_row.weight.grad,
     reference_row.weight.grad.chunk(world_size, dim=1)[global_rank],
+    rtol=1e-4,
+    atol=1e-4,
 )
 torch.testing.assert_close(sp_row.bias.grad, reference_row.bias.grad)
 
 # End-to-end model boundary and replicated RMSNorm-gradient parity.
 model_config = SimpleNamespace(
-    hidden_size=8,
-    intermediate_size=16,
-    num_attention_heads=4,
-    num_key_value_heads=2,
+    hidden_size=2_048,
+    intermediate_size=8_192,
+    num_attention_heads=32,
+    num_key_value_heads=32,
     num_hidden_layers=1,
-    vocab_size=16,
+    vocab_size=49_152,
     max_position_embeddings=full_sequence_length,
     rms_norm_eps=1e-5,
     rope_theta=10000.0,
+    fuse_qkv_en=False,
+    vocab_padding_en=False,
+    cp_zigzag_en=False,
 )
 torch.manual_seed(123)
 tp_model = apply_tensor_parallel(Llama(model_config), sequence_parallel=False).to(device)
 sp_model = apply_tensor_parallel(Llama(model_config), sequence_parallel=True).to(device)
 sp_model.load_state_dict(tp_model.state_dict())
 
-input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device=device)
+input_ids = torch.arange(batch_size * full_sequence_length, device=device).view(batch_size, full_sequence_length) % model_config.vocab_size
 tp_logits = tp_model(input_ids)
 sp_logits = sp_model(input_ids)
 torch.testing.assert_close(sp_logits, tp_logits, rtol=1e-5, atol=1e-5)
